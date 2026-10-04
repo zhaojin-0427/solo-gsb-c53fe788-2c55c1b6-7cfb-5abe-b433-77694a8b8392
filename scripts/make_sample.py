@@ -14,7 +14,7 @@ import io
 import sys
 import zipfile
 
-from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
 
 STUDY_UID = "1.2.826.0.1.3680043.9.7433.1.1"
@@ -25,6 +25,32 @@ SERIES = [
                                                        "1.2.826.0.1.3680043.9.7433.1.1.2.2"]),
 ]
 DATES = [("20200103", "101500"), ("20200103", "101600"), ("20200107", "093000"), ("20200107", "093100")]
+# PHI also hides inside multi-level sequences; the anonymizer must reach every
+# retained dataset level, not just the top-level dataset.
+NESTED_SOURCE_INSTITUTION = "Old General Hospital"
+NESTED_SOURCE_PATIENT_NAME = "Doe^John^Q^Jr"
+NESTED_DEEP_PATIENT_NAME = "JOHNNY DOE (CHART ALIAS)"
+
+
+def add_nested_phi(ds):
+    """Attach a 2-level SQ structure carrying PHI at every level."""
+    deep = Dataset()
+    deep.PatientName = NESTED_DEEP_PATIENT_NAME
+    deep.PatientID = "LEGACY-ID-0001"
+    middle = Dataset()
+    middle.PatientName = NESTED_SOURCE_PATIENT_NAME
+    middle.InstitutionName = NESTED_SOURCE_INSTITUTION
+    middle.StationName = "LEGACY-CT-07"
+    middle.ContentSequence = [deep]
+    top = Dataset()
+    top.PatientName = NESTED_SOURCE_PATIENT_NAME
+    top.InstitutionName = NESTED_SOURCE_INSTITUTION
+    # Non-identifying: StudyDescription is in the example policy's keep list
+    # and, like every tag action, the keep applies at all dataset levels.
+    top.StudyDescription = "EXTERNAL SCAN (HISTORICAL)"
+    top.PatientID = "LEGACY-ID-0001"
+    top.ContentSequence = [middle]
+    ds.OriginalAttributesSequence = [top]
 
 
 def make_instance(series_uid, sop_uid, description, date, time, instance_number):
@@ -74,6 +100,7 @@ def make_instance(series_uid, sop_uid, description, date, time, instance_number)
     ds.PixelData = bytes(pixels)
     ds.add_new(0x00090010, "LO", "ACME_SCANNER")
     ds.add_new(0x00091001, "LO", "internal-scan-note")
+    add_nested_phi(ds)
     ds.is_little_endian = True
     ds.is_implicit_VR = False
     buf = io.BytesIO()
@@ -90,7 +117,12 @@ def main() -> None:
                 date, time = DATES[idx]
                 idx += 1
                 payload = make_instance(series_uid, sop_uid, description, date, time, inst_idx)
-                zf.writestr(f"series{series_idx}/instance{inst_idx}.dcm", payload)
+                info = zipfile.ZipInfo(
+                    f"series{series_idx}/instance{inst_idx}.dcm",
+                    date_time=(1980, 1, 1, 0, 0, 0),
+                )
+                info.compress_type = zipfile.ZIP_DEFLATED
+                zf.writestr(info, payload)
     print(f"wrote {out_path}")
     print(f"  study UID:  {STUDY_UID}")
     for series_uid, description, sop_uids in SERIES:

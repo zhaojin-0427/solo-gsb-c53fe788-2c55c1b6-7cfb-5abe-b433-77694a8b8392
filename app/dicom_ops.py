@@ -226,22 +226,63 @@ def hash_value(key: bytes, value: str) -> str:
     return hmac.new(key, f"HASH:{value}".encode("utf-8"), hashlib.sha256).hexdigest()[:16].upper()
 
 
-def apply_actions(ds: Dataset, actions: dict[str, tuple[str, Any]], counters: dict, key: bytes) -> None:
-    for keyword, (action, value) in actions.items():
-        if keyword not in ds:
+def _apply_actions_to_dataset(
+    ds: Dataset, actions: dict[str, tuple[str, Any]], counters: dict, key: bytes
+) -> None:
+    """Apply tag actions to one dataset level.
+
+    Actions descend into every retained SQ item at any nesting depth, so
+    default and explicit actions cover all datasets that survive in the
+    output. An SQ that is itself removed (``del``) or emptied (set to an
+    empty sequence) is not traversed, so its children are never processed
+    or counted.
+    """
+    for elem in list(ds):
+        keyword = elem.keyword
+        if not keyword:
+            # Private creator / unknown element: actions are keyword based,
+            # but an SQ can still carry nested standard tags.
+            if elem.VR == "SQ" and elem.value is not None:
+                for item in elem.value:
+                    _apply_actions_to_dataset(item, actions, counters, key)
             continue
+        action_spec = actions.get(keyword)
+        if action_spec is None:
+            if elem.VR == "SQ" and elem.value is not None:
+                for item in elem.value:
+                    _apply_actions_to_dataset(item, actions, counters, key)
+            continue
+        action, value = action_spec
         if action == "remove":
-            del ds[keyword]
+            del ds[elem.tag]
             counters["tags_removed"] += 1
-        elif action == "empty":
-            setattr(ds, keyword, "")
+            continue  # children of the removed sequence are gone
+        if action == "empty":
+            if elem.VR == "SQ":
+                # Empty the sequence itself; its items (and their tags) are
+                # discarded, so nothing below is processed or counted.
+                setattr(ds, keyword, [])
+            else:
+                setattr(ds, keyword, "")
             counters["tags_emptied"] += 1
-        elif action == "replace":
+            continue
+        if action == "replace":
             setattr(ds, keyword, value)
             counters["tags_replaced"] += 1
         elif action == "hash":
             setattr(ds, keyword, hash_value(key, str(getattr(ds, keyword))))
             counters["tags_hashed"] += 1
+        # Re-fetch: the element may have been replaced; descend into the
+        # sequence that is actually attached to the dataset.
+        current = ds.get(elem.tag)
+        if current is not None and current.VR == "SQ" and current.value is not None:
+            for item in current.value:
+                _apply_actions_to_dataset(item, actions, counters, key)
+
+
+def apply_actions(ds: Dataset, actions: dict[str, tuple[str, Any]], counters: dict, key: bytes) -> None:
+    """Apply the compiled policy actions to *ds* recursively at every SQ level."""
+    _apply_actions_to_dataset(ds, actions, counters, key)
 
 
 def remove_private_tags(ds: Dataset) -> int:

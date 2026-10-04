@@ -112,6 +112,11 @@ _DS_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
 _AS_RE = re.compile(r"^\d{3}[DWMY]$")
 _CS_RE = re.compile(r"^[A-Z0-9_ ]{0,16}$")
 _TEXT_VRS = {"AE", "LO", "LT", "PN", "SH", "ST", "UC", "UR", "UT"}
+#: Binary / attribute-tag VRs cannot hold a scalar replacement, empty string
+#: or hash; attempting it at runtime would fail to encode.
+BINARY_VRS = {"OB", "OD", "OF", "OL", "OV", "OW", "UN", "AT"}
+#: VRs that may hold the hashed-tag hex string.
+HASHABLE_VRS = _TEXT_VRS | {"DA", "TM", "DT", "UI", "IS", "DS", "AS", "CS"}
 
 
 def validate_vr_value(vr: str, value: Any) -> Optional[str]:
@@ -215,7 +220,8 @@ def validate_policy(policy: Any) -> list[dict]:
 
     def _claim(kw: str, action: str) -> bool:
         """Register keyword -> action; report conflicts. Returns validity."""
-        if tag_for_keyword(kw) is None:
+        tag = tag_for_keyword(kw)
+        if tag is None:
             errors.append(_err("POLICY_INVALID", f"unknown DICOM keyword {kw!r} in tags.{action}"))
             return False
         if kw in PROTECTED_KEYWORDS and action != "keep":
@@ -224,6 +230,25 @@ def validate_policy(policy: Any) -> list[dict]:
                     "POLICY_CONFLICT",
                     f"tag {kw} is managed by the anonymizer (UID mapping / pixel handling) "
                     f"and cannot be assigned action '{action}'",
+                )
+            )
+            return False
+        vr = dictionary_VR(tag)
+        if action == "empty" and vr not in HASHABLE_VRS and vr != "SQ":
+            # SQ empties to a zero-item sequence; binary VRs cannot be "".
+            errors.append(
+                _err(
+                    "POLICY_CONFLICT",
+                    f"tag {kw} (VR {vr}) cannot be emptied; use 'remove' "
+                    "or an action supported by its value representation",
+                )
+            )
+            return False
+        if action == "hash" and vr not in HASHABLE_VRS:
+            errors.append(
+                _err(
+                    "POLICY_CONFLICT",
+                    f"tag {kw} (VR {vr}) cannot be hashed; hashing requires a scalar text-like tag",
                 )
             )
             return False
@@ -255,6 +280,14 @@ def validate_policy(policy: Any) -> list[dict]:
         if not _claim(kw, "replace"):
             continue
         vr = dictionary_VR(tag_for_keyword(kw))
+        if vr in BINARY_VRS or vr == "SQ":
+            errors.append(
+                _err(
+                    "POLICY_CONFLICT",
+                    f"tag {kw} (VR {vr}) cannot be replaced with a scalar policy value",
+                )
+            )
+            continue
         msg = validate_vr_value(vr, value)
         if msg:
             errors.append(

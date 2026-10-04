@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from pydicom import dcmread
+from pydicom.dataelem import DataElement_from_raw, RawDataElement
 from pydicom.dataset import Dataset
 from pydicom.errors import InvalidDicomError
 from pydicom.multival import MultiValue
@@ -71,33 +72,73 @@ def read_dicom(data: bytes) -> tuple[Optional[Dataset], Optional[str], Optional[
         return None, None, "not-a-dicom-file"
 
 
+def _iter_elements_safe(ds: Dataset, name: str, errors: list[dict]) -> list:
+    """Collect elements recursively, itemizing elements with bad VRs.
+
+    A raw element whose VR is unknown cannot be converted by pydicom;
+    accessing it directly reports INVALID_VR (including its tag) and skips
+    it instead of aborting the whole file's validation, so every problem
+    in the archive is reported together.
+    """
+    collected: list = []
+
+    def _walk(dataset: Dataset) -> None:
+        # Iterate the internal dict: freshly read datasets keep RawDataElements
+        # there, and accessing an unknown-VR raw element through the normal API
+        # raises before it can be reported.
+        for raw in list(dataset._dict.values()):
+            if isinstance(raw, RawDataElement):
+                if raw.VR not in dicom_ops.VALID_VRS:
+                    errors.append(
+                        err(
+                            name,
+                            "INVALID_VR",
+                            f"element {raw.tag} has unknown VR {raw.VR!r}",
+                            tag=str(raw.tag),
+                        )
+                    )
+                    continue
+                try:
+                    elem = DataElement_from_raw(raw, dataset._character_set)
+                except Exception as exc:
+                    errors.append(
+                        err(name, "INVALID_DICOM", f"element {raw.tag} cannot be decoded: {exc}", tag=str(raw.tag))
+                    )
+                    continue
+            else:
+                elem = raw
+                if elem.VR not in dicom_ops.VALID_VRS:
+                    errors.append(
+                        err(name, "INVALID_VR", f"element {elem.tag} has unknown VR {elem.VR!r}", tag=str(elem.tag))
+                    )
+                    continue
+            collected.append(elem)
+            if elem.VR == "SQ" and elem.value is not None:
+                for item in elem.value:
+                    _walk(item)
+
+    _walk(ds)
+    return collected
+
+
 def validate_elements(ds: Dataset, name: str) -> list[dict]:
     """Walk every element (recursively) and flag illegal VRs / malformed values."""
     errors: list[dict] = []
-    try:
-        elements = list(ds.iterall())
-    except Exception as exc:
-        return [err(name, "INVALID_DICOM", f"cannot iterate dataset elements: {exc}")]
+    elements = _iter_elements_safe(ds, name, errors)
     for elem in elements:
-        vr = elem.VR
-        if vr not in dicom_ops.VALID_VRS:
-            errors.append(
-                err(name, "INVALID_VR", f"element {elem.tag} has unknown VR {vr!r}", tag=str(elem.tag))
-            )
-            continue
-        if vr in ("DA", "TM", "DT", "UI"):
+        if elem.VR in ("DA", "TM", "DT", "UI"):
             values = elem.value if isinstance(elem.value, MultiValue) else [elem.value]
             for value in values:
                 if value is None or str(value) == "":
                     continue
-                problem = dicom_ops.validate_value_format(vr, str(value))
+                problem = dicom_ops.validate_value_format(vr=elem.VR, value=str(value))
                 if problem:
                     keyword = elem.keyword or str(elem.tag)
                     errors.append(
                         err(
                             name,
                             "INVALID_VALUE",
-                            f"{keyword} ({vr}) value {str(value)!r}: {problem}",
+                            f"{keyword} ({elem.VR}) value {str(value)!r}: {problem}",
                             tag=str(elem.tag),
                         )
                     )

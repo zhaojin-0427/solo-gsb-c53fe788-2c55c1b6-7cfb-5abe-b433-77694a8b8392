@@ -48,6 +48,7 @@ def make_dcm(
     transfer_syntax=ExplicitVRLittleEndian,
     with_private=False,
     referenced_uid=None,
+    nested_phi_depth=0,
     omit=(),
 ):
     meta = FileMetaDataset()
@@ -99,6 +100,20 @@ def make_dcm(
         ref.ReferencedSOPClassUID = CTImageStorage
         ref.ReferencedSOPInstanceUID = referenced_uid
         ds.ReferencedSOPSequence = [ref]
+    if nested_phi_depth:
+        # PHI hidden at nested_phi_depth SQ levels; each level also carries
+        # PHI of its own so every retained dataset must be processed.
+        child = None
+        for depth in range(nested_phi_depth, 0, -1):
+            node = Dataset()
+            node.PatientName = f"Doe^Level{depth}"
+            node.PatientID = f"PAT-L{depth}"
+            node.InstitutionName = f"Secret Hospital L{depth}"
+            node.PatientBirthDate = "19900101"
+            if child is not None:
+                node.ContentSequence = [child]
+            child = node
+        ds.OriginalAttributesSequence = [child]
     for keyword in omit:
         if keyword in ds:
             del ds[keyword]
@@ -310,6 +325,213 @@ def test_referenced_uid_remapped_consistently(client):
         if "ReferencedSOPSequence" in ds
     ]
     assert refs == [mapper.map("1.12.10")]
+
+
+# ---------------------------------------------------------------------------
+# Nested sequence (SQ) anonymization
+# ---------------------------------------------------------------------------
+PHI_KEYWORDS = (
+    "PatientName",
+    "PatientID",
+    "InstitutionName",
+    "PatientBirthDate",
+    "ReferringPhysicianName",
+    "StudyDescription",
+    "StationName",
+)
+
+
+def iter_datasets(ds):
+    """Yield the top-level dataset and every dataset nested inside SQs."""
+    yield ds
+    for elem in ds:
+        if elem.VR == "SQ" and elem.value is not None:
+            for item in elem.value:
+                yield from iter_datasets(item)
+
+
+def test_phi_inside_nested_sequences_is_cleaned(client):
+    files = {
+        "nested.dcm": make_dcm("1.30.1", "1.30.2", "1.30.3", nested_phi_depth=3),
+    }
+    job_id = submit(client, make_zip(files), BASE_POLICY)
+    status = get_job(client, job_id)
+    assert status["status"] == "done", status
+    summary = status["audit"]["summary"]
+    # 4 datasets (top + 3 SQ levels) each carry PatientName/InstitutionName/
+    # PatientBirthDate (emptied) and PatientID (hashed).
+    assert summary["tags_emptied"] >= 4 * 3
+    assert summary["tags_hashed"] == 4
+
+    (out_ds,) = read_output_instances(download(client, job_id)).values()
+    for dataset in iter_datasets(out_ds):
+        for keyword in PHI_KEYWORDS:
+            if keyword in dataset:
+                if keyword == "PatientID":
+                    assert str(dataset.PatientID) != "PAT-L1"
+                    assert len(str(dataset.PatientID)) == 16
+                else:
+                    assert str(getattr(dataset, keyword)) == "", (keyword, str(getattr(dataset, keyword)))
+    # hierarchy itself survives
+    sq = out_ds.OriginalAttributesSequence
+    assert len(sq) == 1
+    assert len(sq[0].ContentSequence) == 1
+    assert len(sq[0].ContentSequence[0].ContentSequence) == 1
+
+
+def test_nested_sequence_structure_and_uids_preserved(client):
+    study, series = "1.31.1", "1.31.2"
+    files = {
+        "a.dcm": make_dcm(study, series, "1.31.10", instance_number=1, nested_phi_depth=2),
+        "b.dcm": make_dcm(study, series, "1.31.11", instance_number=2, nested_phi_depth=2),
+    }
+    job_id = submit(client, make_zip(files), BASE_POLICY)
+    status = get_job(client, job_id)
+    assert status["status"] == "done"
+    instances = read_output_instances(download(client, job_id))
+    mapper = UIDMapper(policy_key(BASE_POLICY))
+    for ds in instances.values():
+        assert str(ds.StudyInstanceUID) == mapper.map(study)
+        assert str(ds.SeriesInstanceUID) == mapper.map(series)
+        assert str(ds.SOPInstanceUID).startswith("2.25.")
+        assert str(ds.file_meta.MediaStorageSOPInstanceUID) == str(ds.SOPInstanceUID)
+        item = ds.OriginalAttributesSequence[0]
+        nested = item.ContentSequence[0]
+        assert str(item.PatientName) == ""
+        assert str(nested.InstitutionName) == ""
+
+
+def test_policy_removing_whole_sequence_does_not_process_children(client):
+    files = {"sq.dcm": make_dcm("1.32.1", "1.32.2", "1.32.3", nested_phi_depth=3)}
+    policy = dict(BASE_POLICY, tags={"remove": ["OriginalAttributesSequence"]})
+    job_id = submit(client, make_zip(files), policy)
+    status = get_job(client, job_id)
+    assert status["status"] == "done"
+    summary = status["audit"]["summary"]
+    # Only the top-level tags are actioned: one removed sequence, the usual
+    # top-level emptied/hashed tags; nested occurrences are never counted.
+    assert summary["tags_removed"] == 1
+    assert summary["tags_hashed"] == 1  # top-level PatientID only
+    (ds,) = read_output_instances(download(client, job_id)).values()
+    assert "OriginalAttributesSequence" not in ds
+
+
+def test_empty_action_on_sequence_clears_children(client):
+    files = {"sq.dcm": make_dcm("1.33.1", "1.33.2", "1.33.3", nested_phi_depth=2)}
+    policy = dict(BASE_POLICY, tags={"empty": ["OriginalAttributesSequence"]})
+    job_id = submit(client, make_zip(files), policy)
+    status = get_job(client, job_id)
+    assert status["status"] == "done"
+    assert status["audit"]["summary"]["tags_emptied"] >= 1
+    (ds,) = read_output_instances(download(client, job_id)).values()
+    assert "OriginalAttributesSequence" in ds
+    assert list(ds.OriginalAttributesSequence) == []
+
+
+def test_explicit_actions_also_cover_nested_datasets(client):
+    # An explicit remove must fire at the top level and inside every
+    # retained SQ item; the audit counts each actual occurrence.
+    files = {"sq.dcm": make_dcm("1.34.1", "1.34.2", "1.34.3", nested_phi_depth=2)}
+    policy = dict(BASE_POLICY, tags={"remove": ["InstitutionName"]})
+    job_id = submit(client, make_zip(files), policy)
+    status = get_job(client, job_id)
+    assert status["status"] == "done"
+    assert status["audit"]["summary"]["tags_removed"] == 3  # top + 2 nested levels
+    (ds,) = read_output_instances(download(client, job_id)).values()
+    for dataset in iter_datasets(ds):
+        assert "InstitutionName" not in dataset
+
+
+def test_hash_or_replace_on_sq_tag_is_policy_conflict(client):
+    for action_policy in (
+        {"tags": {"hash": ["OriginalAttributesSequence"]}},
+        {"tags": {"replace": {"OriginalAttributesSequence": "x"}}},
+        {"tags": {"empty": ["PixelData"]}},
+    ):
+        job_id = submit(client, three_instance_zip(), dict(BASE_POLICY, **action_policy))
+        status = get_job(client, job_id)
+        assert status["status"] == "failed"
+        assert any(e["code"] == "POLICY_CONFLICT" for e in status["errors"])
+
+
+def _explicit_vr_element(group, element, vr: str, value: bytes) -> bytes:
+    """Serialize one element as Explicit VR Little Endian."""
+    head = group.to_bytes(2, "little") + element.to_bytes(2, "little") + vr.encode("ascii")
+    if len(value) % 2:
+        value += b"\x00"  # even-length padding is part of the value field
+    if vr in ("OB", "OD", "OF", "OL", "OV", "OW", "SQ", "UC", "UN", "UR", "UT"):
+        head += b"\x00\x00" + len(value).to_bytes(4, "little")
+    else:
+        head += len(value).to_bytes(2, "little")
+    return head + value
+
+
+def _sq_with_bad_vr_bytes() -> bytes:
+    """Explicit VR Little Endian DICOM with an unknown VR inside an SQ.
+
+    The file meta group is produced by pydicom (well-formed); the main
+    dataset (including the nested SQ item) is handcrafted so an illegal
+    VR that pydicom itself refuses to write can still be fed through the
+    reader and reach validation.
+    """
+    bad = _explicit_vr_element(0x0011, 0x0010, "ZZ", b"BAD")
+    item = b"\xFE\xFF\x00\xE0" + len(bad).to_bytes(4, "little") + bad
+    item += b"\xFE\xFF\x00\xE0\x00\x00\x00\x00"  # item delimitation
+    body = b"".join(
+        _explicit_vr_element(g, e, vr, val)
+        for g, e, vr, val in (
+            (0x0008, 0x0016, "UI", CTImageStorage.encode() + b"\x00"),
+            (0x0008, 0x0018, "UI", b"1.35.3"),
+            (0x0020, 0x000D, "UI", b"1.35.1"),
+            (0x0020, 0x000E, "UI", b"1.35.2"),
+            (0x0010, 0x0010, "PN", b"Doe^Top"),
+            (0x0010, 0x0020, "LO", b"PAT-1"),
+            (0x0008, 0x0020, "DA", b"20200101"),
+        )
+    ) + _explicit_vr_element(0x0400, 0x0561, "SQ", item)
+
+    meta = FileMetaDataset()
+    meta.FileMetaInformationVersion = b"\x00\x01"
+    meta.MediaStorageSOPClassUID = CTImageStorage
+    meta.MediaStorageSOPInstanceUID = "1.35.3"
+    meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    shell = FileDataset(None, Dataset(), file_meta=meta, preamble=b"\x00" * 128)
+    shell.is_little_endian = True
+    shell.is_implicit_VR = False
+    # A harmless even-group element marks where the main dataset starts;
+    # split the serialized stream there so only the (correctly counted) file
+    # meta group precedes our handcrafted body.
+    shell.StudyDate = "20000101"
+    meta_buf = io.BytesIO()
+    shell.save_as(meta_buf, write_like_original=False)
+    serialized = meta_buf.getvalue()
+    marker = _explicit_vr_element(0x0008, 0x0020, "DA", b"20000101")
+    cut = serialized.index(marker)
+    return serialized[:cut] + body
+
+
+def test_illegal_vr_inside_nested_sequence_rejected(client):
+    raw = _sq_with_bad_vr_bytes()
+    # sanity: it parses and the unknown VR lives inside the nested item
+    parsed = dcmread(io.BytesIO(raw))
+    assert parsed.OriginalAttributesSequence  # tag (0011,0010) is below (0400,0561)
+    job_id = submit(client, make_zip({"bad.dcm": raw}), BASE_POLICY)
+    status = get_job(client, job_id)
+    assert status["status"] == "failed"
+    assert any(
+        e["file"] == "bad.dcm" and e["code"] == "INVALID_VR" and "ZZ" in e["message"]
+        for e in status["errors"]
+    )
+    assert client.get(f"/jobs/{job_id}/download").status_code == 409
+
+
+def test_nested_cleaning_is_byte_deterministic():
+    payload = make_zip({"sq.dcm": make_dcm("1.36.1", "1.36.2", "1.36.3", nested_phi_depth=3)})
+    errors1, result1, audit1, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
+    errors2, result2, audit2, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
+    assert errors1 == errors2 == []
+    assert result1 == result2
+    assert audit1 == audit2
 
 
 # ---------------------------------------------------------------------------

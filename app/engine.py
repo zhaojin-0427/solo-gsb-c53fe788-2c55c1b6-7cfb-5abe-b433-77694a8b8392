@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from pydicom import dcmread
+from pydicom.dataelem import RawDataElement
 from pydicom.dataset import Dataset
 from pydicom.errors import InvalidDicomError
 from pydicom.multival import MultiValue
@@ -72,35 +73,55 @@ def read_dicom(data: bytes) -> tuple[Optional[Dataset], Optional[str], Optional[
 
 
 def validate_elements(ds: Dataset, name: str) -> list[dict]:
-    """Walk every element (recursively) and flag illegal VRs / malformed values."""
+    """Walk every element (recursively) and flag illegal VRs / malformed values.
+
+    Sequences are traversed through their raw item datasets so that an unknown
+    VR or malformed value nested inside an SQ item is reported per element
+    instead of aborting the whole walk.
+    """
     errors: list[dict] = []
+
+    def walk(dataset: Dataset) -> None:
+        for tag in list(dataset._dict.keys()):
+            raw = dataset._dict[tag]
+            is_raw = isinstance(raw, RawDataElement)
+            vr = getattr(raw, "VR", None)
+            if is_raw and vr not in dicom_ops.VALID_VRS:
+                errors.append(
+                    err(name, "INVALID_VR", f"element {raw.tag} has unknown VR {vr!r}", tag=str(raw.tag))
+                )
+                continue
+            try:
+                elem = dataset[tag]  # force raw -> converted (raises on bad data)
+            except Exception as exc:
+                errors.append(
+                    err(name, "INVALID_DICOM", f"element {raw.tag} cannot be decoded: {exc}", tag=str(raw.tag))
+                )
+                continue
+            if vr in ("DA", "TM", "DT", "UI"):
+                values = elem.value if isinstance(elem.value, MultiValue) else [elem.value]
+                for value in values:
+                    if value is None or str(value) == "":
+                        continue
+                    problem = dicom_ops.validate_value_format(vr, str(value))
+                    if problem:
+                        keyword = elem.keyword or str(elem.tag)
+                        errors.append(
+                            err(
+                                name,
+                                "INVALID_VALUE",
+                                f"{keyword} ({vr}) value {str(value)!r}: {problem}",
+                                tag=str(elem.tag),
+                            )
+                        )
+            if elem.VR == "SQ" and elem.value is not None:
+                for item in elem.value:
+                    walk(item)
+
     try:
-        elements = list(ds.iterall())
+        walk(ds)
     except Exception as exc:
         return [err(name, "INVALID_DICOM", f"cannot iterate dataset elements: {exc}")]
-    for elem in elements:
-        vr = elem.VR
-        if vr not in dicom_ops.VALID_VRS:
-            errors.append(
-                err(name, "INVALID_VR", f"element {elem.tag} has unknown VR {vr!r}", tag=str(elem.tag))
-            )
-            continue
-        if vr in ("DA", "TM", "DT", "UI"):
-            values = elem.value if isinstance(elem.value, MultiValue) else [elem.value]
-            for value in values:
-                if value is None or str(value) == "":
-                    continue
-                problem = dicom_ops.validate_value_format(vr, str(value))
-                if problem:
-                    keyword = elem.keyword or str(elem.tag)
-                    errors.append(
-                        err(
-                            name,
-                            "INVALID_VALUE",
-                            f"{keyword} ({vr}) value {str(value)!r}: {problem}",
-                            tag=str(elem.tag),
-                        )
-                    )
     return errors
 
 
@@ -400,8 +421,11 @@ def anonymize_zip(
     offsets: dict[str, Any] = {}
     for inst in instances:
         ds = inst.ds
-        dicom_ops.remap_uids(ds, mapper)
+        # Tag actions run first: a removed/emptied sequence takes its whole
+        # subtree away, so UID remapping, private-tag removal and date shifting
+        # only see datasets that survive under the same policy.
         dicom_ops.apply_actions(ds, actions, counters, key)
+        dicom_ops.remap_uids(ds, mapper)
         if remove_private:
             counters["private_tags_removed"] += dicom_ops.remove_private_tags(ds)
         if shift_enabled:

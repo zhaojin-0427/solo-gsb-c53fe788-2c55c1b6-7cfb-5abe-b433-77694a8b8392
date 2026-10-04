@@ -48,6 +48,7 @@ def make_dcm(
     transfer_syntax=ExplicitVRLittleEndian,
     with_private=False,
     referenced_uid=None,
+    nested_sq=None,
     omit=(),
 ):
     meta = FileMetaDataset()
@@ -99,6 +100,8 @@ def make_dcm(
         ref.ReferencedSOPClassUID = CTImageStorage
         ref.ReferencedSOPInstanceUID = referenced_uid
         ds.ReferencedSOPSequence = [ref]
+    if nested_sq is not None:
+        ds.VerifyingObserverSequence = nested_sq
     for keyword in omit:
         if keyword in ds:
             del ds[keyword]
@@ -115,6 +118,42 @@ def make_zip(files: dict) -> bytes:
         for name, data in files.items():
             zf.writestr(name, data)
     return buf.getvalue()
+
+
+def make_nested_sq(referenced_uid=None):
+    """A multi-level SQ tree carrying PHI (and optionally a UID reference)
+    at several depths, including a private tag inside an item dataset:
+
+    VerifyingObserverSequence[0]
+      PatientName / InstitutionName / VerifyingObserverName  (depth 1)
+      private creator-style tag (odd group)
+      OriginalAttributesSequence[0]                           (depth 2)
+        PatientName / ReferringPhysicianName
+        OriginalAttributesSequence[0]                         (depth 3)
+          PatientName / InstitutionName
+          ReferencedSOPSequence[0] -> referenced_uid          (depth 4)
+    """
+    leaf = Dataset()
+    leaf.PatientName = "Leaf^Patient"
+    leaf.InstitutionName = "Leaf Clinic"
+    if referenced_uid:
+        leaf_ref = Dataset()
+        leaf_ref.ReferencedSOPClassUID = CTImageStorage
+        leaf_ref.ReferencedSOPInstanceUID = referenced_uid
+        leaf.ReferencedSOPSequence = [leaf_ref]
+
+    middle = Dataset()
+    middle.PatientName = "Middle^Patient"
+    middle.ReferringPhysicianName = "Middle^Doctor"
+    middle.OriginalAttributesSequence = [leaf]
+
+    top = Dataset()
+    top.PatientName = "Observer^Patient"
+    top.InstitutionName = "Top Clinic"
+    top.VerifyingObserverName = "Observer^Verifier"
+    top.add_new(0x00091002, "LO", "SQ-SECRET")
+    top.OriginalAttributesSequence = [middle]
+    return [top]
 
 
 @pytest.fixture()
@@ -310,6 +349,257 @@ def test_referenced_uid_remapped_consistently(client):
         if "ReferencedSOPSequence" in ds
     ]
     assert refs == [mapper.map("1.12.10")]
+
+
+# ---------------------------------------------------------------------------
+# Nested SQ items: default + explicit tag actions at every dataset level
+# ---------------------------------------------------------------------------
+def _assert_no_nested_phi(ds):
+    """No default-profile PHI value may survive at any retained SQ depth."""
+    phi_keywords = ("PatientName", "InstitutionName", "ReferringPhysicianName",
+                    "VerifyingObserverName", "VerifyingOrganization")
+    for elem in ds.iterall():
+        assert elem.VR != "PN" or not str(elem.value or "").strip(), (elem.tag, elem.value)
+        if elem.keyword in phi_keywords:
+            assert not str(elem.value or "").strip(), (elem.keyword, elem.value)
+        if elem.tag.group % 2 == 1:
+            raise AssertionError(f"private tag survived inside sequence: {elem.tag}")
+
+
+def test_default_actions_reach_all_sq_levels(client):
+    study, series = "1.30.1", "1.30.2"
+    files = {
+        "a.dcm": make_dcm(
+            study, series, "1.30.10", instance_number=1,
+            nested_sq=make_nested_sq(referenced_uid="1.30.11"),
+        ),
+        "b.dcm": make_dcm(
+            study, series, "1.30.11", instance_number=2,
+            nested_sq=make_nested_sq(),
+        ),
+    }
+    job_id = submit(client, make_zip(files), BASE_POLICY)
+    status = get_job(client, job_id)
+    assert status["status"] == "done", status
+    summary = status["audit"]["summary"]
+    # the nested tree contributes PatientName/InstitutionName/... occurrences on
+    # three levels; counts reflect every processed occurrence, not just tops
+    assert summary["tags_emptied"] >= 10
+    # the in-SQ private tag and two top-level-less private tags are all removed
+    assert summary["private_tags_removed"] >= 2
+
+    instances = read_output_instances(download(client, job_id))
+    mapper = UIDMapper(policy_key(BASE_POLICY))
+    for ds in instances.values():
+        _assert_no_nested_phi(ds)
+        # hierarchy / sequence shells survive
+        seq = ds.VerifyingObserverSequence
+        assert len(seq) == 1
+        assert len(seq[0].OriginalAttributesSequence) == 1
+        assert len(seq[0].OriginalAttributesSequence[0].OriginalAttributesSequence) == 1
+    # nested UID references remap consistently to their mapped instances
+    a = [ds for ds in instances.values() if str(ds.SOPInstanceUID) == mapper.map("1.30.10")][0]
+    leaf = a.VerifyingObserverSequence[0].OriginalAttributesSequence[0].OriginalAttributesSequence[0]
+    assert str(leaf.ReferencedSOPSequence[0].ReferencedSOPInstanceUID) == mapper.map("1.30.11")
+    # class UIDs inside sequences are preserved, not remapped
+    assert str(leaf.ReferencedSOPSequence[0].ReferencedSOPClassUID) == str(CTImageStorage)
+
+
+def make_removed_sq_tree(extra_uid):
+    """3-level SQ tree with PHI, a private tag and an otherwise-unseen UI."""
+    leaf = Dataset()
+    leaf.PatientName = "Leaf^Patient"
+    leaf.InstitutionName = "Leaf Clinic"
+    leaf.DeviceUID = extra_uid
+    leaf.add_new(0x00091003, "LO", "PRIVATE-IN-SQ")
+    middle = Dataset()
+    middle.PatientName = "Mid^Patient"
+    middle.OriginalAttributesSequence = [leaf]
+    top = Dataset()
+    top.PatientName = "Top^Patient"
+    top.OriginalAttributesSequence = [middle]
+    return [top]
+
+
+def test_removed_sequence_subtree_is_not_processed_or_counted(client):
+    study, series = "1.31.1", "1.31.2"
+    extra_uid = "1.31.999"
+
+    def build():
+        files = {
+            "a.dcm": make_dcm(study, series, "1.31.10", instance_number=1),
+            "b.dcm": make_dcm(study, series, "1.31.11", instance_number=2),
+        }
+        out = {}
+        for name, payload in files.items():
+            ds = dcmread(io.BytesIO(payload))
+            ds.RequestAttributesSequence = make_removed_sq_tree(extra_uid)
+            buf = io.BytesIO()
+            ds.save_as(buf, write_like_original=False)
+            out[name] = buf.getvalue()
+        return make_zip(out)
+
+    payload = build()
+    control_id = submit(client, payload, BASE_POLICY)
+    control = get_job(client, control_id)
+    assert control["status"] == "done"
+
+    remove_policy = dict(BASE_POLICY, tags={"remove": ["RequestAttributesSequence"]})
+    job_id = submit(client, payload, remove_policy)
+    status = get_job(client, job_id)
+    assert status["status"] == "done", status
+    removed_output = read_output_instances(download(client, job_id))
+    assert all("RequestAttributesSequence" not in ds for ds in removed_output.values())
+
+    cs, rs = control["audit"]["summary"], status["audit"]["summary"]
+    # sequence itself counted once per instance as removed ...
+    assert rs["tags_removed"] == 2
+    # ... but its subtree is neither processed nor counted
+    assert rs["tags_emptied"] < cs["tags_emptied"]
+    assert rs["uids_mapped"] < cs["uids_mapped"]
+    assert rs["private_tags_removed"] < cs["private_tags_removed"]
+    assert extra_uid not in status["audit"]["uid_mapping"]
+    assert extra_uid in control["audit"]["uid_mapping"]
+    # removing the SQ changes the bytes, which stay deterministic
+    from app.engine import anonymize_zip
+    e1, z1, a1, _ = anonymize_zip(payload, remove_policy, None, SECRET)
+    e2, z2, a2, _ = anonymize_zip(payload, remove_policy, None, SECRET)
+    assert e1 == e2 == [] and z1 == z2 and a1 == a2
+
+
+def test_explicit_actions_reach_all_sq_levels(client):
+    study, series = "1.32.1", "1.32.2"
+    policy = dict(
+        BASE_POLICY,
+        tags={
+            "empty": ["Manufacturer"],
+            "hash": ["DeviceID"],
+            "replace": {"PerformingPhysicianName": "DOC^ANON"},
+        },
+    )
+
+    def item_with_explicit_tags():
+        item = Dataset()
+        item.Manufacturer = "ACME"
+        item.DeviceID = "DEV-42"
+        item.PerformingPhysicianName = "Real^Doc"
+        return item
+
+    files = {"d.dcm": make_dcm(study, series, "1.32.10")}
+    ds = dcmread(io.BytesIO(files["d.dcm"]))
+    ds.Manufacturer = "ACME"
+    ds.DeviceID = "DEV-42"
+    ds.PerformingPhysicianName = "Real^Doc"
+    top_item = item_with_explicit_tags()
+    nested_item = item_with_explicit_tags()
+    # depth 2 item, then depth 3 item
+    deeper = item_with_explicit_tags()
+    nested_item.OriginalAttributesSequence = [deeper]
+    top_item.OriginalAttributesSequence = [nested_item]
+    ds.VerifyingObserverSequence = [top_item]
+    buf = io.BytesIO()
+    ds.save_as(buf, write_like_original=False)
+    files = {"d.dcm": buf.getvalue()}
+
+    job_id = submit(client, make_zip(files), policy)
+    status = get_job(client, job_id)
+    assert status["status"] == "done", status
+    summary = status["audit"]["summary"]
+    # 1 top-level + 3 nested occurrences (top_item, nested_item, deeper)
+    assert summary["tags_emptied"] >= 4
+    assert summary["tags_hashed"] >= 4
+    assert summary["tags_replaced"] >= 4
+
+    (out,) = read_output_instances(download(client, job_id)).values()
+
+    def check_level(d):
+        assert str(d.Manufacturer) == ""
+        assert len(str(d.DeviceID)) == 16 and str(d.DeviceID) != "DEV-42"
+        assert str(d.PerformingPhysicianName) == "DOC^ANON"
+
+    check_level(out)
+    lvl1 = out.VerifyingObserverSequence[0]
+    lvl2 = lvl1.OriginalAttributesSequence[0]
+    lvl3 = lvl2.OriginalAttributesSequence[0]
+    check_level(lvl1)
+    check_level(lvl2)
+    check_level(lvl3)
+
+
+def test_empty_sq_action_keeps_empty_sequence(client):
+    files = {
+        "r.dcm": make_dcm("1.33.1", "1.33.2", "1.33.10", referenced_uid="1.33.11"),
+        "t.dcm": make_dcm("1.33.1", "1.33.2", "1.33.11"),
+    }
+    policy = dict(BASE_POLICY, tags={"empty": ["ReferencedSOPSequence"]})
+    job_id = submit(client, make_zip(files), policy)
+    status = get_job(client, job_id)
+    assert status["status"] == "done", status
+    instances = read_output_instances(download(client, job_id))
+    ref_ds = [ds for ds in instances.values() if "ReferencedSOPSequence" in ds][0]
+    assert list(ref_ds.ReferencedSOPSequence) == []
+
+
+def test_illegal_vr_inside_sq_rejected_per_item(client):
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = CTImageStorage
+    meta.MediaStorageSOPInstanceUID = "1.34.10"
+    meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset("m", {}, file_meta=meta, preamble=b"\x00" * 128)
+    ds.is_little_endian, ds.is_implicit_VR = True, False
+    ds.SOPClassUID = CTImageStorage
+    ds.SOPInstanceUID = "1.34.10"
+    ds.StudyInstanceUID = "1.34.1"
+    ds.SeriesInstanceUID = "1.34.2"
+    ds.PatientID = "p"
+    item = Dataset()
+    item.InstitutionName = "SQVRCLINIC"
+    ds.VerifyingObserverSequence = [item]
+    buf = io.BytesIO()
+    ds.save_as(buf, write_like_original=False)
+    raw = buf.getvalue()
+    marker = raw.find(b"SQVRCLINIC")
+    assert raw[marker - 4 : marker - 2] == b"LO"
+    patched = raw[: marker - 4] + b"XX" + raw[marker - 2 :]
+
+    job_id = submit(client, make_zip({"bad_sq.dcm": patched}), BASE_POLICY)
+    status = get_job(client, job_id)
+    assert status["status"] == "failed"
+    assert any(
+        e["code"] == "INVALID_VR" and e["file"] == "bad_sq.dcm"
+        and e.get("tag") == "(0008, 0080)"
+        for e in status["errors"]
+    )
+    assert client.get(f"/jobs/{job_id}/download").status_code == 409
+
+
+def test_illegal_value_inside_sq_rejected_per_item(client):
+    item = Dataset()
+    item.ContentDate = "20201340"
+    ds = dcmread(io.BytesIO(make_dcm("1.35.1", "1.35.2", "1.35.10")))
+    ds.VerifyingObserverSequence = [item]
+    buf = io.BytesIO()
+    ds.save_as(buf, write_like_original=False)
+    job_id = submit(client, make_zip({"bad.dcm": buf.getvalue()}), BASE_POLICY)
+    status = get_job(client, job_id)
+    assert status["status"] == "failed"
+    assert any(
+        e["code"] == "INVALID_VALUE" and e["file"] == "bad.dcm" and e.get("tag")
+        for e in status["errors"]
+    )
+
+
+def test_policy_conflict_for_sequence_actions(client):
+    policy = dict(
+        BASE_POLICY,
+        tags={"hash": ["RequestAttributesSequence"],
+              "replace": {"ReferencedSOPSequence": "not-a-sequence"}},
+    )
+    job_id = submit(client, three_instance_zip(), policy)
+    status = get_job(client, job_id)
+    assert status["status"] == "failed"
+    assert sum(1 for e in status["errors"] if e["code"] == "POLICY_CONFLICT") >= 2
+    assert client.get(f"/jobs/{job_id}/download").status_code == 409
 
 
 # ---------------------------------------------------------------------------

@@ -58,6 +58,8 @@ DEFAULT_EMPTY_KEYWORDS = [
     "PerformingPhysicianName",
     "NameOfPhysiciansReadingStudy",
     "OperatorsName",
+    "VerifyingObserverName",
+    "VerifyingOrganization",
     "InstitutionName",
     "InstitutionAddress",
     "InstitutionalDepartmentName",
@@ -215,7 +217,8 @@ def validate_policy(policy: Any) -> list[dict]:
 
     def _claim(kw: str, action: str) -> bool:
         """Register keyword -> action; report conflicts. Returns validity."""
-        if tag_for_keyword(kw) is None:
+        tag = tag_for_keyword(kw)
+        if tag is None:
             errors.append(_err("POLICY_INVALID", f"unknown DICOM keyword {kw!r} in tags.{action}"))
             return False
         if kw in PROTECTED_KEYWORDS and action != "keep":
@@ -224,6 +227,15 @@ def validate_policy(policy: Any) -> list[dict]:
                     "POLICY_CONFLICT",
                     f"tag {kw} is managed by the anonymizer (UID mapping / pixel handling) "
                     f"and cannot be assigned action '{action}'",
+                )
+            )
+            return False
+        if dictionary_VR(tag) == "SQ" and action in ("hash", "replace"):
+            errors.append(
+                _err(
+                    "POLICY_CONFLICT",
+                    f"tag {kw} is a sequence (SQ); action '{action}' cannot apply to a "
+                    "sequence (use 'remove' to drop it or 'empty' to keep an empty sequence)",
                 )
             )
             return False

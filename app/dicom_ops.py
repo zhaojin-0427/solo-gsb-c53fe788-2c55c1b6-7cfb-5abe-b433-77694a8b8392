@@ -227,21 +227,39 @@ def hash_value(key: bytes, value: str) -> str:
 
 
 def apply_actions(ds: Dataset, actions: dict[str, tuple[str, Any]], counters: dict, key: bytes) -> None:
-    for keyword, (action, value) in actions.items():
-        if keyword not in ds:
-            continue
-        if action == "remove":
-            del ds[keyword]
-            counters["tags_removed"] += 1
-        elif action == "empty":
-            setattr(ds, keyword, "")
-            counters["tags_emptied"] += 1
-        elif action == "replace":
-            setattr(ds, keyword, value)
-            counters["tags_replaced"] += 1
-        elif action == "hash":
-            setattr(ds, keyword, hash_value(key, str(getattr(ds, keyword))))
-            counters["tags_hashed"] += 1
+    """Apply compiled tag actions to *every* dataset level, recursively.
+
+    The same policy covers the top-level dataset and every item dataset that
+    survives inside nested sequences (at any depth). When an action removes a
+    whole sequence (or empties one), its item datasets are never visited, so
+    their children are neither processed nor counted. Each remaining occurrence
+    of an actioned tag contributes one to the audit counters.
+    """
+    for elem in list(ds):
+        keyword = elem.keyword
+        entry = actions.get(keyword)
+        if entry is not None:
+            action, value = entry
+            if action == "remove":
+                del ds[elem.tag]
+                counters["tags_removed"] += 1
+                continue  # whole subtree is gone: do not descend into it
+            if action == "empty":
+                counters["tags_emptied"] += 1
+                if elem.VR == "SQ":
+                    # keep the sequence shell, drop every item (and subtree)
+                    setattr(ds, keyword, [])
+                    continue
+                setattr(ds, keyword, "")
+            elif action == "replace":
+                setattr(ds, keyword, value)
+                counters["tags_replaced"] += 1
+            elif action == "hash":
+                setattr(ds, keyword, hash_value(key, str(elem.value)))
+                counters["tags_hashed"] += 1
+        if elem.VR == "SQ" and elem.value is not None:
+            for item in elem.value:
+                apply_actions(item, actions, counters, key)
 
 
 def remove_private_tags(ds: Dataset) -> int:

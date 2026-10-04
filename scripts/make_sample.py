@@ -6,6 +6,20 @@ one study with two series x two instances of synthetic 128x128 16-bit CT
 images, complete with fake PHI, a private tag and dates spread over several
 days. The UIDs are fixed so examples/redactions.json matches series 1.
 
+Each instance additionally carries:
+
+* a retained multi-level sequence tree
+  (``VerifyingObserverSequence`` -> ``OriginalAttributesSequence`` ->
+  ``OriginalAttributesSequence``) with PHI, a private tag and a
+  ``ReferencedSOPInstanceUID`` at the leaves — demonstrating that tag actions
+  and UID remapping recurse into every retained SQ level;
+* a ``RequestAttributesSequence`` with PHI nested inside, which the shipped
+  ``examples/policy.json`` removes wholesale (its subtree is then neither
+  processed nor counted).
+
+The ZIP is written with fixed timestamps/entry order, so regenerating it
+yields byte-identical output.
+
 Usage: python scripts/make_sample.py [output.zip]
 """
 from __future__ import annotations
@@ -14,6 +28,7 @@ import io
 import sys
 import zipfile
 
+from pydicom.dataset import Dataset
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
 
@@ -25,6 +40,53 @@ SERIES = [
                                                        "1.2.826.0.1.3680043.9.7433.1.1.2.2"]),
 ]
 DATES = [("20200103", "101500"), ("20200103", "101600"), ("20200107", "093000"), ("20200107", "093100")]
+
+#: every instance UID, used to build valid in-archive SQ references
+ALL_INSTANCE_UIDS = [uid for _, _, uids in SERIES for uid in uids]
+
+
+def retained_sq_tree(sop_uid: str):
+    """Multi-level SQ tree that survives anonymization (PHI gets recursed into)."""
+    referenced_uid = ALL_INSTANCE_UIDS[(ALL_INSTANCE_UIDS.index(sop_uid) + 1) % len(ALL_INSTANCE_UIDS)]
+    leaf_ref = Dataset()
+    leaf_ref.ReferencedSOPClassUID = CTImageStorage
+    leaf_ref.ReferencedSOPInstanceUID = referenced_uid
+
+    leaf = Dataset()
+    leaf.PatientName = "Leaf^Patient"
+    leaf.InstitutionName = "Leaf Street Clinic"
+    leaf.ReferencedSOPSequence = [leaf_ref]
+
+    middle = Dataset()
+    middle.PatientName = "History^Patient"
+    middle.ReferringPhysicianName = "History^Doctor"
+    middle.StudyDescription = "historical study note"
+    middle.OriginalAttributesSequence = [leaf]
+
+    top = Dataset()
+    top.PatientName = "Observer^Jane"
+    top.VerifyingObserverName = "Verifier^Jane"
+    top.VerifyingOrganization = "Jane Verification Board"
+    top.InstitutionName = "Observer Institute"
+    top.add_new(0x00091002, "LO", "observer-private-note")
+    top.OriginalAttributesSequence = [middle]
+    return [top]
+
+
+def removed_sq_tree():
+    """Nested PHI inside RequestAttributesSequence; policy 1.0 removes this SQ."""
+    leaf = Dataset()
+    leaf.PatientName = "Request^Leaf"
+    leaf.InstitutionName = "Request Clinic"
+    middle = Dataset()
+    middle.PatientName = "Request^Middle"
+    middle.AccessionNumber = "REQ-ACC-0001"
+    middle.OriginalAttributesSequence = [leaf]
+    top = Dataset()
+    top.PatientName = "Request^Top"
+    top.RequestingPhysician = "Requesting^Doctor"
+    top.OriginalAttributesSequence = [middle]
+    return [top]
 
 
 def make_instance(series_uid, sop_uid, description, date, time, instance_number):
@@ -74,6 +136,8 @@ def make_instance(series_uid, sop_uid, description, date, time, instance_number)
     ds.PixelData = bytes(pixels)
     ds.add_new(0x00090010, "LO", "ACME_SCANNER")
     ds.add_new(0x00091001, "LO", "internal-scan-note")
+    ds.VerifyingObserverSequence = retained_sq_tree(sop_uid)
+    ds.RequestAttributesSequence = removed_sq_tree()
     ds.is_little_endian = True
     ds.is_implicit_VR = False
     buf = io.BytesIO()
@@ -83,14 +147,21 @@ def make_instance(series_uid, sop_uid, description, date, time, instance_number)
 
 def main() -> None:
     out_path = sys.argv[1] if len(sys.argv) > 1 else "sample_input.zip"
+    entries = []
     idx = 0
+    for series_idx, (series_uid, description, sop_uids) in enumerate(SERIES, 1):
+        for inst_idx, sop_uid in enumerate(sop_uids, 1):
+            date, time = DATES[idx]
+            idx += 1
+            payload = make_instance(series_uid, sop_uid, description, date, time, inst_idx)
+            entries.append((f"series{series_idx}/instance{inst_idx}.dcm", payload))
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for series_idx, (series_uid, description, sop_uids) in enumerate(SERIES, 1):
-            for inst_idx, sop_uid in enumerate(sop_uids, 1):
-                date, time = DATES[idx]
-                idx += 1
-                payload = make_instance(series_uid, sop_uid, description, date, time, inst_idx)
-                zf.writestr(f"series{series_idx}/instance{inst_idx}.dcm", payload)
+        for name, payload in entries:
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 0
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, payload, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
     print(f"wrote {out_path}")
     print(f"  study UID:  {STUDY_UID}")
     for series_uid, description, sop_uids in SERIES:

@@ -9,8 +9,11 @@
 - **确定性 UID 映射**：按 Study/Series/Instance 关系，用 HMAC-SHA256 将原始 UID
   映射为 `2.25.<decimal>` 形式的新 UID；同一 UID 在所有实例及引用处
   （`ReferencedSOPInstanceUID` 等）一致替换，保持引用完整性。
-- **PHI 清除**：内置类 DICOM PS3.15 基本档案（姓名、出生日期、机构、医师、
-  入组号等置空，`PatientID` 哈希化），默认删除全部私有标签；策略可增删改。
+- **PHI 清除（覆盖所有 SQ 层级）**：内置类 DICOM PS3.15 基本档案（姓名、出生日期、
+  机构、医师、入组号等置空，`PatientID` 哈希化），默认删除全部私有标签；
+  默认动作与策略中的 `empty`/`remove`/`hash`/`replace` 动作按同一策略递归作用于
+  **顶层数据集及保留下来的每一层序列项（含嵌套 SQ）**。策略整条移除某个序列时，
+  其子项不再被处理或计数；`empty` 一个序列则保留空序列壳。策略可增删改。
 - **日期重写且保持时间差**：按患者派生确定性偏移（天数 + 秒级抖动），
   所有 DA/TM/DT 标签同步平移，跨实例时间差逐秒保持。
 - **像素遮挡**：按遮挡框（instance/series/study 三级作用域）真正覆写像素
@@ -45,7 +48,7 @@ docker compose up --build
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
-pytest tests/ -q          # 25 项测试
+pytest tests/ -q          # 32 项测试
 ```
 
 ## 示例请求
@@ -53,8 +56,18 @@ pytest tests/ -q          # 25 项测试
 ### 1. 生成示例数据（1 个检查 × 2 个序列 × 2 个实例，含模拟 PHI）
 
 ```bash
-python scripts/make_sample.py          # 生成 sample_input.zip
+python scripts/make_sample.py          # 生成字节确定的 sample_input.zip
 ```
+
+每个实例除顶层 PHI 外还携带：
+
+- 一棵**保留的多层序列树**
+  `VerifyingObserverSequence → OriginalAttributesSequence → OriginalAttributesSequence`，
+  各层都含 `PatientName`/`InstitutionName` 等 PHI、一个私有标签，叶节点含
+  `ReferencedSOPSequence`（指向包内其他实例）；
+- 一棵 `RequestAttributesSequence`，其子项同样含多层 PHI——示例策略会把它整条移除。
+
+ZIP 使用固定条目顺序与 1980-01-01 时间戳写入，重新生成逐字节一致。
 
 ### 2. 提交匿名化作业
 
@@ -68,9 +81,13 @@ curl -s -X POST http://localhost:8000/jobs \
 响应（HTTP 202；重复提交返回 200 与同一 `job_id`）：
 
 ```json
-{ "job_id": "3c941a6a80179ace51d62ae6c5f03581", "status": "queued",
-  "status_url": "/jobs/3c941a6a80179ace51d62ae6c5f03581" }
+{ "job_id": "bf15134291c77befb7fcd26b0b33bcb9", "status": "queued",
+  "status_url": "/jobs/bf15134291c77befb7fcd26b0b33bcb9", "detail": null }
 ```
+
+> 下列示例数值用 `docker compose` 的默认 `ANON_SECRET=change-me-in-production`
+> 实跑采集；设置了其他密钥时 `job_id`、映射 UID 与哈希会不同。重新生成的
+> `sample_input.zip` 与示例策略字节固定，所以同一密钥下结果可逐字节复验。
 
 ### 3. 查询状态与审计摘要
 
@@ -78,40 +95,78 @@ curl -s -X POST http://localhost:8000/jobs \
 curl -s http://localhost:8000/jobs/<job_id>
 ```
 
-成功时（节选）：
+成功时（节选，来自对 `sample_input.zip` + `examples/policy.json` 的真实调用）：
 
 ```json
 {
+  "job_id": "bf15134291c77befb7fcd26b0b33bcb9",
   "status": "done",
   "policy_version": "1.0",
-  "policy_sha256": "692118d4…",
+  "policy_sha256": "1c0d2dd6424dc99a890d877fd54488fca69367c8eea49437ed191c79b37d8175",
+  "input_sha256": "2bcc31fa707c4b9c50a71781cde5a2b24abe9dd20ded1eb0b651bf222760739e",
   "audit": {
     "summary": { "studies": 1, "series": 2, "instances": 4,
-                 "uids_mapped": 7, "tags_emptied": 24, "tags_hashed": 4,
-                 "private_tags_removed": 8, "date_tags_shifted": 16,
+                 "uids_mapped": 7, "tags_removed": 4, "tags_emptied": 52,
+                 "tags_replaced": 8, "tags_hashed": 4,
+                 "private_tags_removed": 12, "date_tags_shifted": 16,
                  "redaction_boxes_applied": 2 },
-    "uid_mapping": { "1.2.826.0.1.3680043.9.7433.1.1": "2.25.1795…", "…": "…" },
-    "output": { "zip_sha256": "06a305c1…", "files": [ … ] }
+    "uid_mapping": {
+      "1.2.826.0.1.3680043.9.7433.1.1":     "2.25.303989340376998048752381211511128573336",
+      "1.2.826.0.1.3680043.9.7433.1.1.1":   "2.25.93670731803630432347505141810977829969"
+    },
+    "output": { "zip_sha256": "8b487ea8372293ee0c23a79d4061afb060391c9bc5446c03718a440ac0c4b814",
+                "files": [
+      { "path": "STUDY_0001/SERIES_0001/INSTANCE_00001.dcm",
+        "sha256": "02d822b43a7cb63f0e04eb80e0564eeb8a855220fa8f698e56de4cd7811efa97",
+        "study_instance_uid":  "2.25.303989340376998048752381211511128573336",
+        "series_instance_uid": "2.25.93670731803630432347505141810977829969",
+        "sop_instance_uid":    "2.25.145337988595756024462092823072960691239" } ] }
   },
-  "result": { "sha256": "06a305c1…", "size_bytes": 136327,
-              "download_url": "/jobs/<job_id>/download" }
+  "result": { "sha256": "8b487ea8372293ee0c23a79d4061afb060391c9bc5446c03718a440ac0c4b814",
+              "size_bytes": 15990,
+              "download_url": "/jobs/bf15134291c77befb7fcd26b0b33bcb9/download" }
 }
 ```
 
-失败时（逐项错误，无半成品）：
+上述计数体现递归处理：`tags_removed=4` 即 4 个实例各移除 1 个
+`RequestAttributesSequence`，其子树（`PatientName`、私有标签、额外 UID 等）
+不再处理也不计入 `tags_emptied`/`private_tags_removed`/`uids_mapped`；
+保留的 `VerifyingObserverSequence` 三层项内 PHI 均被清空、叶节点引用 UID
+被一致重映射，序列层级结构原样保留。
+
+失败时（逐项错误，无半成品；非法 VR / 非法值即使位于 SQ 项内也按标签逐项报告）：
 
 ```json
-{ "status": "failed",
-  "errors": [ { "file": "compressed.dcm", "code": "COMPRESSED_PIXELS",
-                "message": "compressed transfer syntax 1.2.840.10008.1.2.4.50 is not supported; …" } ] }
+{ "job_id": "89468715c44f29e4e5cf1733d29f3782", "status": "failed",
+  "errors": [
+    { "file": "compressed.dcm", "code": "COMPRESSED_PIXELS",
+      "message": "compressed transfer syntax 1.2.840.10008.1.2.4.50 is not supported; …",
+      "tag": null } ],
+  "audit": null, "result": null }
 ```
 
 ### 4. 下载并复验
 
 ```bash
-curl -s -OJ http://localhost:8000/jobs/<job_id>/download
-sha256sum anonymized-<job_id>.zip        # 与 result.sha256 / audit.output.zip_sha256 一致
-unzip -p anonymized-<job_id>.zip manifest.json   # 内含逐文件 SHA-256 与映射后 UID
+curl -s -OJ http://localhost:8000/jobs/bf15134291c77befb7fcd26b0b33bcb9/download
+sha256sum anonymized-bf15134291c77befb7fcd26b0b33bcb9.zip
+# 8b487ea8…c4b814  anonymized-…zip  —— 与 result.sha256 / audit.output.zip_sha256 一致
+unzip -p anonymized-bf15134291c77befb7fcd26b0b33bcb9.zip manifest.json   # 逐文件 SHA-256 与映射后 UID
+```
+
+可用 pydicom 直接确认多层 SQ 的清洗结果：
+
+```python
+from pydicom import dcmread
+import io, zipfile
+zf = zipfile.ZipFile("anonymized-bf15134291c77befb7fcd26b0b33bcb9.zip")
+ds = dcmread(io.BytesIO(zf.read("STUDY_0001/SERIES_0001/INSTANCE_00001.dcm")))
+assert "RequestAttributesSequence" not in ds                 # 整条移除
+leaf = (ds.VerifyingObserverSequence[0]
+          .OriginalAttributesSequence[0]
+          .OriginalAttributesSequence[0])
+assert leaf.PatientName == "" and leaf.InstitutionName == "" # 深层 PHI 已清空
+assert str(leaf.ReferencedSOPSequence[0].ReferencedSOPInstanceUID).startswith("2.25.")
 ```
 
 ## API 一览
@@ -136,7 +191,7 @@ unzip -p anonymized-<job_id>.zip manifest.json   # 内含逐文件 SHA-256 与�
   "tags": {
     "keep":    ["PatientSex", "PatientAge", "StudyDescription"],
     "empty":   ["InstitutionName"],
-    "remove":  ["PatientAddress"],
+    "remove":  ["PatientAddress", "RequestAttributesSequence"],
     "hash":    ["PatientID"],
     "replace": { "ReferringPhysicianName": "ANON^MD" }
   }
@@ -147,18 +202,23 @@ unzip -p anonymized-<job_id>.zip manifest.json   # 内含逐文件 SHA-256 与�
 - `salt`：可选项目级盐，并入策略哈希，隔离不同项目的映射结果。
 - `remove_private_tags`（默认 `true`）：删除全部奇数组号私有标签（含序列内）。
 - `strict_references`（默认 `true`）：实例引用的 SOPInstanceUID 必须都在
-  提交包内，否则报 `MISSING_REFERENCE`。
+  提交包内，否则报 `MISSING_REFERENCE`（检查发生在动作执行前，因此即使引用
+  位于随后会被移除的序列内也仍会被检查）。
 - `date_shift.max_days`：日期偏移上限（0–3650 天），偏移量由
   HMAC(患者键) 确定性派生，同一患者所有实例一致。
 - `tags`：在默认档案之上叠加。`keep` 将标签从默认清除动作中豁免；
-  `empty`/`remove`/`hash`/`replace` 追加或覆盖默认动作。
+  `empty`/`remove`/`hash`/`replace` 追加或覆盖默认动作。**所有动作都递归
+  作用于顶层及保留下来的每一层 SQ 项数据集**，按标签出现次数逐项执行并计入
+  审计；`remove` 一个 SQ 标签会整条删除该序列且不再遍历/计数其子项，
+  `empty` 一个 SQ 标签则保留一个空序列（项全部丢弃）；对 SQ 标签使用
+  `hash`/`replace` 报 `POLICY_CONFLICT`。
 - 同一标签被赋予两个动作、`replace` 值违反标签 VR、或试图修改
   受管标签（`StudyInstanceUID`、`PixelData`、行列像素描述符等）
   均报 `POLICY_CONFLICT`。
 
-默认档案：约 30 个 PHI 标签置空（姓名、生日、机构、医师、入组号、
-检查/序列描述等），`PatientID` 哈希（HMAC-SHA256 前 16 位十六进制），
-`PatientSex/Age/Size/Weight` 默认保留。完整清单见 `GET /policies`。
+默认档案：37 个 PHI 标签置空（姓名、生日、机构、医师、入组号、
+检查/序列描述、核实人姓名/机构等），`PatientID` 哈希（HMAC-SHA256 前 16 位
+十六进制），`PatientSex/Age/Size/Weight` 默认保留。完整清单见 `GET /policies`。
 
 ## 像素遮挡框
 
@@ -186,7 +246,7 @@ unzip -p anonymized-<job_id>.zip manifest.json   # 内含逐文件 SHA-256 与�
 | `MISSING_UID` | 缺少 SOP/Study/Series Instance UID 或 SOP Class UID |
 | `DUPLICATE_INSTANCE` | 同一 SOPInstanceUID 出现多次 |
 | `MISSING_REFERENCE` | 引用的 SOPInstanceUID 不在提交包内 |
-| `INVALID_VR` / `INVALID_VALUE` | 未知 VR 或 DA/TM/DT/UI 值非法（附标签号） |
+| `INVALID_VR` / `INVALID_VALUE` | 未知 VR 或 DA/TM/DT/UI 值非法（附标签号；递归检查 SQ 项内元素） |
 | `COMPRESSED_PIXELS` | JPEG/RLE/Deflated 等压缩传输语法（需先解压） |
 | `UNSUPPORTED_TRANSFER_SYNTAX` | 非隐式/显式 VR Little Endian（如 Big Endian） |
 | `UNSUPPORTED_PIXEL_LAYOUT` | 遮挡目标像素布局不支持 |
